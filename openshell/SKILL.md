@@ -107,6 +107,25 @@ if ! podman machine list --format '{{.Running}}' | grep -q true; then
 fi
 ```
 
+**macOS Podman post-restart fixes** — these must be applied after every `podman machine start` or reboot:
+
+```bash
+# Fix socket permissions (reverts to rw-rw---- after restart)
+podman machine ssh -- 'sudo chmod 666 /run/podman/podman.sock'
+
+# Fix host.containers.internal resolution (Podman 5.x bug: IP not set)
+podman machine ssh -- 'grep -q host_containers_internal_ip /etc/containers/containers.conf 2>/dev/null || sudo tee /etc/containers/containers.conf > /dev/null <<EOF
+[containers]
+host_containers_internal_ip = "192.168.127.1"
+EOF'
+
+# Restart socket to pick up config, then re-fix permissions
+podman machine ssh -- 'sudo systemctl restart podman.socket'
+podman machine ssh -- 'sudo chmod 666 /run/podman/podman.sock'
+```
+
+Without these fixes: gateway gets "permission denied" on the socket, and sandboxes can't resolve `host.containers.internal` to reach the gateway.
+
 ### 1.3 Generate TLS Certificates
 
 Determine paths based on platform and runtime:
@@ -147,13 +166,17 @@ Build the gateway run command based on detected platform and runtime:
 ```bash
 $RUNTIME run -d --name openshell-gateway --restart always \
     -p 0.0.0.0:17670:17670 \
+    --network podman --network openshell \
     -v $CONFIGDIR:$CONFIGDIR \
     -v $STATEDIR:$STATEDIR \
+    --security-opt label=disable \
     -e HOME=$HOME \
     -e OPENSHELL_DRIVERS=$RUNTIME \
     ghcr.io/nvidia/openshell/gateway:latest \
     --bind-address 0.0.0.0 --port 17670
 ```
+
+**IMPORTANT**: The gateway must be on **both** the `podman` and `openshell` networks. Sandboxes run on the `openshell` network and need to reach the gateway directly. If the `openshell` network doesn't exist, create it first: `podman network create openshell`.
 
 **Platform-specific additions:**
 
@@ -185,7 +208,20 @@ for i in $(seq 1 10); do
 done
 ```
 
-### 1.6 Prompt for Provider Setup
+### 1.6 Add nftables Rules (macOS + Podman only)
+
+Sandbox containers resolve `host.containers.internal` to `192.168.127.1` (the Mac host), but the Podman VM doesn't consider that address "local" so traffic is dropped. Add DNAT rules to forward sandbox traffic to the gateway's actual IP on the `openshell` network:
+
+```bash
+GW_IP=$(podman machine ssh -- "sudo podman inspect openshell-gateway --format '{{json .NetworkSettings.Networks}}' | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d['openshell']['IPAddress'])\"")
+
+podman machine ssh -- "sudo nft add rule inet netavark PREROUTING ip saddr 10.89.1.0/24 ip daddr 192.168.127.1 tcp dport 17670 dnat to $GW_IP:17670"
+podman machine ssh -- "sudo nft add rule inet netavark POSTROUTING ip saddr 10.89.1.0/24 ip daddr $GW_IP tcp dport 17670 masquerade"
+```
+
+These rules are lost on Podman machine restart and must be re-added. Without them, sandbox health checks fail with "can't reach gateway."
+
+### 1.7 Prompt for Provider Setup
 
 Ask: "Gateway is up. Do you want to set up an LLM provider now?"
 
@@ -301,7 +337,7 @@ openshell sandbox create \
     '
 ```
 
-Ask the user for `ANTHROPIC_VERTEX_PROJECT_ID` and `VERTEX_LOCATION` if not already known. Check for the ADC file at `$HOME/.config/gcloud/application_default_credentials.json` before proceeding.
+Ask the user for `ANTHROPIC_VERTEX_PROJECT_ID` and `VERTEX_LOCATION` if not already known. **IMPORTANT**: `VERTEX_LOCATION` must be a specific region (e.g., `us-east5`), NOT `global`. The `global` endpoint does not support Vertex AI inference and will cause 403 errors or "fetch URL is invalid" failures. Check for the ADC file at `$HOME/.config/gcloud/application_default_credentials.json` before proceeding.
 
 For direct Anthropic API:
 ```bash
@@ -703,6 +739,8 @@ network_policies: {}
 - `rules` and `access` are mutually exclusive on the same endpoint — use one or the other
 - `*` in path globs does not cross `/` boundaries; use `**` for recursive matching
 - Deny rules take precedence over allow rules
+- **`allow_encoded_slash: true`**: Required on endpoints whose URLs contain `%2F` (e.g., `registry.npmjs.org` for npm packages). Without it, the proxy rejects the encoded slash with a parse error. Must be used with `protocol: rest`.
+- **Binary paths must match the actual resolved binary**, not just the symlink. For example, OpenCode's `/usr/local/bin/opencode` may resolve to `/usr/lib/node_modules/opencode-ai/bin/.opencode` — the policy must include the resolved path. To find it, run `readlink -f $(which <binary>)` inside the sandbox.
 
 ---
 
@@ -719,6 +757,12 @@ network_policies: {}
 | Sandbox create hangs | Gateway can't reach container runtime socket | `$RUNTIME logs openshell-gateway` | Verify socket path, restart gateway |
 | `connection refused` on `openshell status` | Gateway not registered or not running | `openshell gateway select` to check registration | Re-register or start gateway |
 | Port forward not working | Sandbox not running or port not exposed | `openshell sandbox get <name>` | Verify sandbox is running, use `--forward` on create |
+| Sandbox health check fails / can't reach gateway | Missing nftables DNAT rules (macOS) | Sandbox logs show connection timeout to gateway | Re-add nftables rules (Step 1.6) |
+| Socket permission denied (os error 13) | Podman socket permissions reset after VM restart | `ls -la /run/podman/podman.sock` inside VM | `podman machine ssh -- 'sudo chmod 666 /run/podman/podman.sock'` |
+| `host.containers.internal` resolves to empty/wrong IP | Podman 5.x bug — `host_containers_internal_ip` not set | `podman machine ssh -- cat /etc/containers/containers.conf` | Add `host_containers_internal_ip = "192.168.127.1"` (Step 1.2) |
+| 403 or "fetch URL is invalid" with Vertex AI | `VERTEX_LOCATION` set to `global` | Check env vars inside sandbox | Use a specific region like `us-east5` |
+| npm `%2F` encoded slash rejected by proxy | Endpoint missing `allow_encoded_slash: true` | Logs show parse error on registry.npmjs.org | Add `allow_encoded_slash: true` to the endpoint with `protocol: rest` |
+| Policy denies the correct binary | Policy has symlink path, not resolved path | Compare `which <bin>` vs `readlink -f $(which <bin>)` | Add the resolved binary path to the policy |
 
 ### Diagnostic commands
 
